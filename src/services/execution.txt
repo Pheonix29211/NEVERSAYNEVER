@@ -1,0 +1,204 @@
+from __future__ import annotations
+import os, asyncio, time
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Callable
+import aiohttp
+
+from ..config import Cfg
+from ..log import logger
+
+@dataclass
+class Fill:
+    side: str; qty: float; px: float; fee_pct: float; slip_pct: float; ts: float
+
+@dataclass
+class Position:
+    ca: str
+    token: str
+    entry_usd: float
+    fills: List[Fill]
+    qty: float
+    vwap: float
+    opened_ts: float
+    trailing_high: float
+    hard_stop_px: float
+    lane: str      # "NEW" | "PROMO" | "TOP1" | "NEW_FAST" | "PROMO_FAST"
+    # Infinite trim ladder state
+    next_trim_at: float            # decimal return threshold: 0.50 = +50%
+    runner_min_frac: float         # never go below this fraction except on stops
+    entry_qty_ref: float           # reference qty at entry for runner math
+
+class RouterAdapter:
+    name = "ABSTRACT"
+    async def quote_buy(self, session: aiohttp.ClientSession, ca: str, usd: float) -> Dict[str, float]:
+        raise NotImplementedError
+    async def quote_sell(self, session: aiohttp.ClientSession, ca: str, qty: float) -> Dict[str, float]:
+        raise NotImplementedError
+    async def execute_buy(self, session: aiohttp.ClientSession, ca: str, usd: float) -> Dict[str, Any]:
+        logger.info(f"[EXEC] DRY execute_buy {ca} ${usd}"); return {"ok": True, "tx": "dry"}
+    async def execute_sell(self, session: aiohttp.ClientSession, ca: str, qty: float) -> Dict[str, Any]:
+        logger.info(f"[EXEC] DRY execute_sell {ca} qty={qty}"); return {"ok": True, "tx": "dry"}
+
+def _trail_width_pct(lane: str, vol_regime: float = 1.0) -> float:
+    base = Cfg.FASTMOVER_TRAIL_PCT/100.0 if lane in ("NEW_FAST","PROMO_FAST","TOP1") else 0.18
+    return max(0.12, min(0.24, base * (1.0 + (vol_regime-1.0)*0.25)))
+
+def _pool_impact_cap(lane: str) -> float:
+    return (Cfg.FASTMOVER_POOL_IMPACT_CAP/100.0) if lane in ("NEW_FAST","PROMO_FAST","TOP1") else (Cfg.POOL_SIZE_PCT_CAP/100.0)
+
+def plan_entry_splits(total_usd: float) -> List[float]:
+    if not Cfg.SPLIT_FILLS: return [total_usd]
+    d = max(1.0, total_usd * float(Cfg.DUST_PCT))
+    c = max(1.0, total_usd * float(Cfg.CORE_PCT))
+    a = max(1.0, total_usd - d - c)
+    return [d, c, a]
+
+def _risk_size(balance_usd: float, lane: str, liq_usd: float) -> float:
+    rf = Cfg.RISK_FRACTION
+    if lane in ("NEW_FAST","PROMO_FAST","TOP1"):
+        rf *= Cfg.FASTMOVER_RISK_MULT
+    size = max(Cfg.FLOOR_USD, balance_usd * rf)
+    pool_cap = liq_usd * _pool_impact_cap(lane)
+    return float(min(size, pool_cap))
+
+def should_time_stop(unrealized_pct: float, minutes_in_trade: float, lane: str) -> bool:
+    if lane not in ("NEW_FAST","PROMO_FAST","TOP1"): return False
+    return minutes_in_trade >= Cfg.FASTMOVER_TIME_STOP_MIN and unrealized_pct < Cfg.FASTMOVER_TIME_STOP_MIN_GAIN
+
+def should_decay_exit(accel_now: float, lane: str, minutes_in_trade: float) -> bool:
+    if lane not in ("NEW_FAST","PROMO_FAST","TOP1"): return False
+    return minutes_in_trade <= 15 and accel_now < Cfg.FASTMOVER_DECAY_ACCEL_EXIT
+
+class ExecutionEngine:
+    def __init__(self, router: RouterAdapter, send_msg: Callable[[str], None]):
+        self.router = router
+        self.send = send_msg
+        self.positions: Dict[str, Position] = {}
+
+    async def enter(self, session: aiohttp.ClientSession, ca: str, token: str, lane: str, balance_usd: float, liq_usd: float) -> Optional[Position]:
+        size = _risk_size(balance_usd, lane, liq_usd)
+        if size <= 0.0:
+            self.send(f"⛔ Skip {token}: computed size was zero.")
+            return None
+
+        parts = plan_entry_splits(size)
+        qty_total = 0.0; cost_total = 0.0
+        t0 = time.time()
+
+        for i,usd_leg in enumerate(parts):
+            q = await self.router.quote_buy(session, ca, usd_leg)
+            fee, slip = q.get("fee_pct", 0.0), q.get("slip_pct", 0.0)
+            if fee > Cfg.FEE_CAP_PCT or slip > Cfg.MAX_SLIPPAGE_PCT:
+                self.send(f"⛔ Skip {token}: route > caps ({fee:.2f}%/{slip:.2f}%).")
+                return None
+            px = q.get("px", 1.0)
+            qty_leg = usd_leg / max(px, 1e-9)
+
+            if not Cfg.DRY_RUN and os.environ.get("EXECUTION_ENABLED","false").lower()=="true":
+                r = await self.router.execute_buy(session, ca, usd_leg)
+                if not r.get("ok"):
+                    self.send(f"⚠️ Entry fail {token} leg{i+1}: router error")
+                    continue
+
+            qty_total += qty_leg; cost_total += usd_leg
+            await asyncio.sleep(0.35)  # micro-stagger against MEV
+
+        if qty_total <= 0.0: return None
+
+        vwap = cost_total / qty_total
+        pos = Position(
+            ca=ca, token=token, entry_usd=cost_total, fills=[],
+            qty=qty_total, vwap=vwap, opened_ts=t0,
+            trailing_high=vwap, hard_stop_px=vwap*0.75,
+            lane=lane,
+            next_trim_at=0.50,                    # first trim at +50%
+            runner_min_frac=Cfg.LOTTO_RUNNER_MIN_FRAC,
+            entry_qty_ref=qty_total
+        )
+        self.positions[ca] = pos
+        self.send(f"🟢 In: {token}. Let the chart cook.")
+        return pos
+
+    async def manage(self, session: aiohttp.ClientSession, ca: str, px_now: float, accel_now: float, liq_now: float):
+        pos = self.positions.get(ca)
+        if not pos: return
+        pnl = (px_now - pos.vwap) / pos.vwap * 100.0
+        minutes = (time.time() - pos.opened_ts) / 60.0
+
+        # Raise hard stop to breakeven after modest gain
+        if pnl >= 20 and pos.hard_stop_px < pos.vwap:
+            pos.hard_stop_px = pos.vwap
+            self.send(f"🛡️ Break-even locked on {pos.token}. No loss allowed now.")
+
+        # Update trailing high and trail width
+        pos.trailing_high = max(pos.trailing_high, px_now)
+        trail_w = _trail_width_pct(pos.lane)
+        trail_px = pos.trailing_high * (1.0 - trail_w)
+
+        # ---------- Infinite trim ladder ----------
+        ch = (px_now - pos.vwap) / pos.vwap  # decimal, e.g. 0.5 = +50%
+        # Progressive trim schedule:
+        # +50% (Cfg.TRIM_PCT_50), +100% (Cfg.TRIM_PCT_100), +200% (Cfg.TRIM_PCT_200),
+        # then every +200%: trim Cfg.LADDER_TRIM_AFTER_200 each time.
+        while pos.qty > pos.entry_qty_ref * pos.runner_min_frac and ch >= pos.next_trim_at:
+            # Decide trim pct based on level
+            if pos.next_trim_at < 1.0:
+                trim_pct = Cfg.TRIM_PCT_50
+                next_step = 1.0
+            elif pos.next_trim_at < 2.0:
+                trim_pct = Cfg.TRIM_PCT_100
+                next_step = 2.0
+            elif abs(pos.next_trim_at - 2.0) < 1e-9:
+                trim_pct = Cfg.TRIM_PCT_200
+                next_step = 2.0 + Cfg.LADDER_STEP_AFTER_200
+            else:
+                trim_pct = Cfg.LADDER_TRIM_AFTER_200
+                next_step = pos.next_trim_at + Cfg.LADDER_STEP_AFTER_200
+
+            # Do not trim below runner floor on trims
+            target_qty_after = max(pos.entry_qty_ref * pos.runner_min_frac, pos.qty * (1.0 - trim_pct))
+            sell_qty = max(0.0, pos.qty - target_qty_after)
+            if sell_qty <= 0: break
+
+            await self._sell_qty(session, pos, sell_qty, px_now, reason=f"trim_{int(pos.next_trim_at*100)}")
+            pos.next_trim_at = next_step
+            # recompute ch in case px moved; qty updated already
+            ch = (px_now - pos.vwap) / pos.vwap
+
+        # ---------- Safety exits ----------
+        if should_time_stop(pnl, minutes, pos.lane):
+            await self._sell_all(session, pos, px_now, reason="time_stop"); return
+        if should_decay_exit(accel_now, pos.lane, minutes):
+            await self._sell_all(session, pos, px_now, reason="decay"); return
+        if px_now <= pos.hard_stop_px:
+            await self._sell_all(session, pos, px_now, reason="hard_stop"); return
+        if px_now <= trail_px:
+            await self._sell_all(session, pos, px_now, reason="trail"); return
+
+    async def _sell_all(self, session: aiohttp.ClientSession, pos: Position, px_now: float, reason: str):
+        await self._sell_qty(session, pos, pos.qty, px_now, reason)
+        self.positions.pop(pos.ca, None)
+        if reason == "trail":       self.send(f"🪤 Trail hit on {pos.token}; booked results, flat.")
+        elif reason == "time_stop": self.send(f"⏱️ No follow-through on {pos.token} — flat at time stop.")
+        elif reason == "decay":     self.send(f"🧊 Momentum cooled on {pos.token} — exiting early (decay).")
+        elif reason == "hard_stop": self.send(f"🔻 Stop hit on {pos.token}. Loss capped.")
+        else:                       self.send(f"✅ Flat {pos.token}.")
+
+    async def _sell_qty(self, session: aiohttp.ClientSession, pos: Position, qty: float, px_now: float, reason: str):
+        if qty <= 0: return
+        # Split exit to reduce slip; for "trim_*" keep runner floor intact handled by caller
+        chunks = [0.35, 0.35, 0.30]
+        remaining = qty
+        for w in chunks:
+            sub = remaining * w
+            q = await self.router.quote_sell(session, pos.ca, sub)
+            slip = float(q.get("slip_pct", 0.0))
+            if slip > Cfg.MAX_EXIT_SLIP: sub *= 0.5
+            if not Cfg.DRY_RUN and os.environ.get("EXECUTION_ENABLED","false").lower()=="true":
+                r = await self.router.execute_sell(session, pos.ca, sub)
+                if not r.get("ok"):
+                    logger.warning(f"[EXEC] sell fail; trying smaller slice")
+                    sub *= 0.5
+                    await self.router.execute_sell(session, pos.ca, sub)
+            pos.qty = max(0.0, pos.qty - sub)
+            await asyncio.sleep(0.3)

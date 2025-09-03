@@ -1,0 +1,13 @@
+fastapi>=0.111.0
+uvicorn>=0.30.0
+aiohttp>=3.9.5
+python-telegram-bot==13.15
+pydantic>=2.7.0
+pandas>=2.2.2
+numpy>=1.26.4
+python-dotenv>=1.0.1
+
+# Execution (sign + send on Solana) — only used in LIVE
+solders==0.26.0
+solana==0.36.9
+base58>=2.1.1

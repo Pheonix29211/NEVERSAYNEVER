@@ -1,0 +1,89 @@
+services:
+  - type: web
+    name: memesniper
+    env: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.app
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: memesniper-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: DRY_RUN
+        value: "true"
+      - key: SOLANA_RPC
+        sync: false
+      - key: SOLANA_WS
+        sync: false
+      - key: SOLANA_PRIVATE_KEY_B58
+        sync: false
+      - key: ROUTER
+        value: "PHOTON"
+      - key: JUPITER_BASE
+        value: "https://quote-api.jup.ag"
+      - key: PHOTON_BASE
+        value: "https://api.photon.trade"
+      - key: PHOTON_API_KEY
+        sync: false
+      - key: FEE_CAP_PCT
+        value: "3"
+      - key: MAX_SLIPPAGE_PCT
+        value: "4"
+      - key: MAX_EXIT_SLIPPAGE_PCT
+        value: "6"
+      - key: MIN_POOL_LIQ_USD
+        value: "20000"
+      - key: POOL_SIZE_PCT_CAP
+        value: "0.25"
+      - key: SPLIT_FILLS
+        value: "true"
+      - key: DUST_PCT
+        value: "0.10"
+      - key: CORE_PCT
+        value: "0.65"
+      - key: ADD_PCT
+        value: "0.25"
+      - key: FLOOR_USD
+        value: "25"
+      - key: RISK_FRACTION
+        value: "0.33"
+      - key: MAX_POSITIONS
+        value: "3"
+      - key: TOKEN_CAP_PCT
+        value: "70"
+      - key: PORTFOLIO_CAP_PCT
+        value: "100"
+      - key: SAFE_MIN_SCORE
+        value: "75"
+      - key: PGS_MIN
+        value: "70"
+      - key: PGS_PROMO_MINUTES
+        value: "10"
+      - key: IAS_WATCH
+        value: "55"
+      - key: IAS_ACC
+        value: "65"
+      - key: IAS_PRIME
+        value: "75"
+      - key: CC_MAX
+        value: "25"
+      - key: MDS_MAX
+        value: "60"
+      - key: REPORT_IST_HHMM
+        value: "21:30"
+      - key: TIMEZONE
+        value: "Asia/Kolkata"
+      - key: LISTINGS_ON
+        value: "true"
+      - key: LIST_SOURCES
+        value: "binance,okx,kucoin,bybit,mexc,bitget,gate"
+      - key: LIST_MODE
+        value: "balanced"
