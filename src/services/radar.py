@@ -25,7 +25,7 @@ async def _universe(session: aiohttp.ClientSession) -> list[str]:
         if m not in s: mints.append(m)
     return mints[:120]
 
-async def run_radar(bot, router, exec_engine, ledger):
+async def run_radar(bot, router, exec_engine, ledger, watchmgr=None):
     last_alert_at: Dict[str, float] = {}     # mint -> last alert timestamp
     cooldown = max(60, Cfg.ALERT_COOLDOWN_MIN * 60)
 
