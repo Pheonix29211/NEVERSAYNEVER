@@ -13,6 +13,9 @@ class Cfg:
     # caps
     FEE_CAP_PCT      = float(os.environ.get("FEE_CAP_PCT", "3.0"))
     MAX_SLIPPAGE_PCT = float(os.environ.get("MAX_SLIPPAGE_PCT", "3.0"))
+    # Jupiter execution tuning
+    JUPITER_SLIPPAGE_BPS   = int(os.environ.get("JUPITER_SLIPPAGE_BPS", "600"))  # 600 = 6%
+    PRIORITY_FEE_LAMPORTS  = int(os.environ.get("PRIORITY_FEE_LAMPORTS", "5000"))  # ~0.000005 SOL
 
     # paper bankroll
     PAPER_MODE_BAL_ENABLED = os.environ.get("PAPER_MODE_BAL_ENABLED", "true").lower() == "true"

@@ -186,20 +186,29 @@ class ExecutionEngine:
         async with aiohttp.ClientSession() as session:
             try:
                 url = f"{self.base}/quote"
-                params = {"inputMint": USDC_MINT, "outputMint": USDC_MINT, "amount": "1000", "slippageBps": "300"}
-                async with session.get(url, params=params, timeout=8) as r:
-                    if r.status != 200:
-                        return {"ok": False, "reason": f"quote_http_{r.status}"}
-            except Exception as e:
-                return {"ok": False, "reason": f"quote_err_{e}"}
-        return {"ok": True, "reason": "ok"}
-
-    async def _build_swap_tx(self, session: aiohttp.ClientSession, route_info: Dict[str, Any], user_pubkey: str) -> Optional[bytes]:
+                params = {
+    "inputMint": USDC_MINT,
+    "outputMint": USDC_MINT,
+    "amount": "1000",
+    "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),   # <-- use env
+}
+async def _build_swap_tx(
+        self,
+        session: aiohttp.ClientSession,
+        route_info: Dict[str, Any],
+        user_pubkey: str
+    ) -> Optional[bytes]:
         """
         Ask Jupiter to build serialized (base64) swap tx from a quote.
         """
         url = f"{self.base}/swap"
-        payload = {"quoteResponse": route_info, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": True}
+        payload = {
+            "quoteResponse": route_info,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True,
+            "slippageBps": Cfg.JUPITER_SLIPPAGE_BPS,
+            "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS,
+        }
         try:
             async with session.post(url, json=payload, timeout=15) as r:
                 if r.status != 200:
