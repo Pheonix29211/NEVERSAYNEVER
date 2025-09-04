@@ -1,7 +1,12 @@
+# Web framework
 fastapi>=0.111.0
 uvicorn>=0.30.0
 aiohttp>=3.9.5
+
+# Telegram bot
 python-telegram-bot==13.15
+
+# Data + validation
 pydantic>=2.7.0
 pandas>=2.2.2
 numpy>=1.26.4
