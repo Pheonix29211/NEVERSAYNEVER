@@ -16,7 +16,8 @@ from telegram.ext import (
 
 from ..config import Cfg
 from ..log import logger
-from ..services.backtest.runner import run_backtest  # keep as in your tree
+from ..services.backtest.runner import run_backtest
+from ..routers.execution import _secret_bytes, ExecutionEngine  # <- unified key loader + engine
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -36,19 +37,19 @@ HELP_TEXT = (
     "/ping — check bot is alive\n"
 )
 
-
 def _fmt_tokens(picked: List[Dict[str, Any]], max_items: int = 15) -> str:
     if not picked:
         return "(no tokens)"
     rows = []
     for t in picked[:max_items]:
         name = t.get("name") or "token"
-        mint = (t.get("mint", "")[:6] + "…") if t.get("mint") else ""
+        mint = (t.get("mint") or "")
+        mint_short = f"{mint[:6]}…" if mint else ""
         mc = t.get("mc") or 0
         lp = t.get("lp") or 0
         pchg = t.get("pchg")
         rows.append(
-            f"• {name} ({mint}) — MC ${mc:,.0f}, LP ${lp:,.0f}, dP≈{pchg if pchg is not None else 'n/a'}%"
+            f"• {name} ({mint_short}) — MC ${mc:,.0f}, LP ${lp:,.0f}, dP≈{pchg if pchg is not None else 'n/a'}%"
         )
     more = len(picked) - min(len(picked), max_items)
     if more > 0:
@@ -132,11 +133,13 @@ class TGBot:
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
+
         target = args[0].lower()
         if target == "paper":
             Cfg.DRY_RUN = True
             u.message.reply_text("🔧 Switched to PAPER mode (no real trades).")
             return
+
         if target == "live":
             pin = os.environ.get("MODE_SWITCH_PIN", "").strip()
             if pin and (len(args) < 2 or args[1] != pin):
@@ -150,14 +153,12 @@ class TGBot:
                 "🟢 Switched to LIVE mode (make sure wallet & funds are configured)."
             )
             return
+
         u.message.reply_text(
-            "Usage: /mode, /mode live [PIN], /mode paper",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage: /mode, /mode live [PIN], /mode paper", parse_mode=ParseMode.MARKDOWN
         )
 
     def _preflight(self, u: Update, c: CallbackContext):
-        from ..routers.execution import ExecutionEngine
-
         async def run():
             ee = ExecutionEngine(Cfg.PHOTON_BASE, lambda m: self.app.bot.send_message(Cfg.ADMIN_CHAT_ID, m))
             res = await ee.preflight()
@@ -171,16 +172,51 @@ class TGBot:
 
     def _wallet(self, u: Update, c: CallbackContext):
         try:
-            # ✅ use the shared key loader (relative import)
-            from ..routers.execution import _load_keypair
-            kp = _load_keypair()
-            if not kp:
+            b = _secret_bytes()  # unified env/file loader -> bytes (32 or 64)
+            if not b:
                 u.message.reply_text(
-                    "No wallet configured. Set SOLANA_KEY_PATH (file) or SOLANA_SECRET_KEY (json/base58)."
+                    "No wallet configured. Set SOLANA_SECRET_KEY (JSON/base58) "
+                    "or SOLANA_KEY_PATH to a key file."
                 )
                 return
+
+            pub = None
+
+            # Try solders first
+            try:
+                from solders.keypair import Keypair as SKeypair  # type: ignore
+                kp = None
+                if len(b) == 64:
+                    kp = SKeypair.from_bytes(b)
+                elif len(b) == 32 and hasattr(SKeypair, "from_seed"):
+                    kp = SKeypair.from_seed(b)
+                if kp:
+                    pub = str(kp.pubkey())
+            except Exception:
+                pass
+
+            # Fallback to solana-py
+            if not pub:
+                try:
+                    from solana.keypair import Keypair as PyKeypair  # type: ignore
+                    kp2 = None
+                    if len(b) == 64:
+                        kp2 = PyKeypair.from_secret_key(b)
+                    elif len(b) == 32 and hasattr(PyKeypair, "from_seed"):
+                        kp2 = PyKeypair.from_seed(b)
+                    if kp2:
+                        pub = str(kp2.public_key)
+                except Exception:
+                    pass
+
+            if not pub:
+                u.message.reply_text(
+                    "Wallet decode error: unsupported key format (need 64-byte secret or 32-byte seed)."
+                )
+                return
+
             u.message.reply_text(
-                f"🔑 Wallet: `{str(kp.pubkey())}`\n(RPC: {Cfg.RPC_URL})",
+                f"🔑 Wallet: `{pub}`\n(RPC: {Cfg.RPC_URL})",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
@@ -197,7 +233,8 @@ class TGBot:
         args = c.args or []
         if not args:
             u.message.reply_text(
-                f"PAPER_AUTOTRADE is {'ON' if Cfg.PAPER_AUTOTRADE else 'OFF'}.\nUse /autopaper on or /autopaper off."
+                f"PAPER_AUTOTRADE is {'ON' if Cfg.PAPER_AUTOTRADE else 'OFF'}.\n"
+                f"Use /autopaper on or /autopaper off."
             )
             return
         v = args[0].lower()
@@ -212,14 +249,20 @@ class TGBot:
 
     def _export(self, u: Update, c: CallbackContext):
         try:
-            tokens_glob = [p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("tokens_")]
-            trades_glob = [p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("trades_")]
+            tokens_glob = [
+                p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("tokens_")
+            ]
+            trades_glob = [
+                p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("trades_")
+            ]
             tokens_glob.sort()
             trades_glob.sort()
             tokens = tokens_glob[-1] if tokens_glob else "(none)"
             trades = trades_glob[-1] if trades_glob else "(none)"
             u.message.reply_text(
-                f"📦 Latest CSVs:\n- Tokens: {os.path.join(Cfg.DATA_DIR, tokens)}\n- Trades: {os.path.join(Cfg.DATA_DIR, trades)}"
+                f"📦 Latest CSVs:\n"
+                f"- Tokens: {os.path.join(Cfg.DATA_DIR, tokens)}\n"
+                f"- Trades: {os.path.join(Cfg.DATA_DIR, trades)}"
             )
         except Exception as e:
             u.message.reply_text(f"Export error: {e}")
@@ -230,32 +273,27 @@ class TGBot:
         except Exception:
             hours = 24
         u.message.reply_text(f"🧪 Running Dex backtest for ~{hours}h…")
-
-        # Offload to a thread so we don't block PTB polling loop
-        async def run_bt():
-            loop = asyncio.get_event_loop()
-            try:
-                res = await loop.run_in_executor(None, lambda: run_backtest(hours=hours))
-                picked = res.get("picked") or []
-                tokens_block = _fmt_tokens(picked, max_items=15)
-                msg = (
-                    "📊 Backtest (Dex + trailing)\n"
-                    f"- Window: ~{hours}h (horizon={res.get('horizon')})\n"
-                    f"- Tokens tested: {res.get('tokens_tested')}\n"
-                    f"- Entries: {res.get('entries')}\n"
-                    f"- Winners/Losers: {res.get('wins')}/{res.get('losses')}\n"
-                    f"- Avg PnL: {res.get('avg_pnl')}%\n"
-                    f"- Top5 Avg: {res.get('top5_avg')}%\n"
-                    f"- Tokens CSV: {res.get('tokens_csv')}\n"
-                    f"- Trades CSV: {res.get('trades_csv')}\n\n"
-                    f"🧾 Picked tokens:\n{tokens_block}"
-                )
-                await self.safe_send(msg)
-            except Exception as e:
-                logger.warning(f"/backtest error: {e}")
-                await self.safe_send(f"⚠️ Backtest failed: {e}")
-
-        asyncio.get_event_loop().create_task(run_bt())
+        try:
+            # If run_backtest is sync, this is fine; if it's async, adapt accordingly.
+            res = asyncio.run(run_backtest(hours=hours))
+            picked = res.get("picked") or []
+            tokens_block = _fmt_tokens(picked, max_items=15)
+            msg = (
+                "📊 Backtest (Dex + trailing)\n"
+                f"- Window: ~{hours}h (horizon={res.get('horizon')})\n"
+                f"- Tokens tested: {res.get('tokens_tested')}\n"
+                f"- Entries: {res.get('entries')}\n"
+                f"- Winners/Losers: {res.get('wins')}/{res.get('losses')}\n"
+                f"- Avg PnL: {res.get('avg_pnl')}%\n"
+                f"- Top5 Avg: {res.get('top5_avg')}%\n"
+                f"- Tokens CSV: {res.get('tokens_csv')}\n"
+                f"- Trades CSV: {res.get('trades_csv')}\n\n"
+                f"🧾 Picked tokens:\n{tokens_block}"
+            )
+            u.message.reply_text(msg)
+        except Exception as e:
+            logger.warning(f"/backtest error: {e}")
+            u.message.reply_text(f"⚠️ Backtest failed: {e}")
 
     def _ping(self, u: Update, c: CallbackContext):
         u.message.reply_text("🏓 pong")
