@@ -207,7 +207,7 @@ async def _build_swap_tx(
             "userPublicKey": user_pubkey,
             "wrapAndUnwrapSol": True,
             "slippageBps": Cfg.JUPITER_SLIPPAGE_BPS,
-            "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS,
+            "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS
         }
         try:
             async with session.post(url, json=payload, timeout=15) as r:
