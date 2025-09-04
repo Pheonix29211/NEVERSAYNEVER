@@ -201,7 +201,7 @@ class ExecutionEngine:
             logger.warning(f"[Exec] swap_build_error: {e}")
             return None
 
-   async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str,Any]) -> Dict[str,Any]:
+      async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str,Any]) -> Dict[str,Any]:
         if Cfg.DRY_RUN:
             return {"ok": True, "simulated": True, "txsig": None}
 
