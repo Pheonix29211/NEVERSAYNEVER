@@ -171,27 +171,43 @@ async def _rpc_get_sol_balance(pubkey_str: str) -> Optional[float]:
 
 # =============================== ExecutionEngine ===============================
 
+# ---------- Execution Engine ----------
+
 class ExecutionEngine:
     def __init__(self, base_quote_url: str, send_msg):
         self.base = base_quote_url.rstrip("/")
         self.send_msg = send_msg
 
     async def preflight(self) -> Dict[str, Any]:
-        # Ensure key can be loaded
-        kp = _load_keypair()
-        if not kp:
+        # quick presence check
+        if not (Cfg.SOLANA_SECRET_KEY or Cfg.SOLANA_KEY_PATH):
+            if not os.path.exists(os.path.join(Cfg.DATA_DIR, "my_wallet_key.json")) and \
+               not os.path.exists(os.path.join(Cfg.DATA_DIR, "phantom_key.json")):
+                return {"ok": False, "reason": "no_wallet"}
+
+        kp_solders, kp_solana = _load_keypairs()
+        if not (kp_solders or kp_solana):
             return {"ok": False, "reason": "wallet_decode"}
 
-        # Ensure send libs exist
         try:
-            from solana.rpc.async_api import AsyncClient  # noqa: F401
+            from solana.rpc.async_api import AsyncClient  # noqa
         except Exception:
             return {"ok": False, "reason": "solana_lib_missing"}
 
-        # Balance check
-        try:
-            pubkey_str = str(kp.pubkey())
-        except Exception:
+        # pick a pubkey to check balance
+        pubkey_str = None
+        if kp_solders is not None:
+            try:
+                pubkey_str = str(kp_solders.pubkey())
+            except Exception:
+                pubkey_str = None
+        if pubkey_str is None and kp_solana is not None:
+            try:
+                pubkey_str = str(kp_solana.public_key)
+            except Exception:
+                pubkey_str = None
+
+        if not pubkey_str:
             return {"ok": False, "reason": "wallet_decode"}
 
         sol = await _rpc_get_sol_balance(pubkey_str)
@@ -200,7 +216,7 @@ class ExecutionEngine:
         if sol < Cfg.LIVE_MIN_SOL_BUFFER:
             return {"ok": False, "reason": f"low_sol ({sol:.4f})"}
 
-        # Probe Jupiter quote
+        # Probe Jupiter API
         async with aiohttp.ClientSession() as session:
             try:
                 url = f"{self.base}/quote"
@@ -208,7 +224,7 @@ class ExecutionEngine:
                     "inputMint": USDC_MINT,
                     "outputMint": USDC_MINT,
                     "amount": "1000",
-                    "slippageBps": "300",
+                    "slippageBps": "300"
                 }
                 async with session.get(url, params=params, timeout=8) as r:
                     if r.status != 200:
@@ -221,16 +237,14 @@ class ExecutionEngine:
         self,
         session: aiohttp.ClientSession,
         route_info: Dict[str, Any],
-        user_pubkey: str,
+        user_pubkey: str
     ) -> Optional[bytes]:
-        """
-        Ask Jupiter to build a base64-serialized VersionedTransaction for the quote.
-        """
+        """Ask Jupiter to build serialized (base64) swap tx from a quote."""
         url = f"{self.base}/swap"
         payload = {
             "quoteResponse": route_info,
             "userPublicKey": user_pubkey,
-            "wrapAndUnwrapSol": True,
+            "wrapAndUnwrapSol": True
         }
         try:
             async with session.post(url, json=payload, timeout=15) as r:
@@ -247,69 +261,77 @@ class ExecutionEngine:
             logger.warning(f"[Exec] swap_build_error: {e}")
             return None
 
-   async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Live BUY execution using solders 0.26.x only.
-    - Builds swap tx via Jupiter
-    - Signs by producing a Signature over the VersionedMessage bytes
-    - Reconstructs VersionedTransaction(message, [sig])
-    - Sends with solana AsyncClient
-    """
-    if Cfg.DRY_RUN:
-        return {"ok": True, "simulated": True, "txsig": None}
+    async def execute_buy(
+        self,
+        mint: str,
+        usd_amount: float,
+        route_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Live BUY execution path. In DRY_RUN, only simulates."""
+        if Cfg.DRY_RUN:
+            return {"ok": True, "simulated": True, "txsig": None}
 
-    # We require solders keypair for this path
-    kp_solders, _kp_solana = _load_keypairs()
-    if kp_solders is None:
-        return {"ok": False, "reason": "wallet_decode"}
+        kp_solders, kp_solana = _load_keypairs()
+        if not (kp_solders or kp_solana):
+            return {"ok": False, "reason": "wallet_decode"}
 
-    # Build the swap transaction (unsigned)
-    pubkey_str = str(kp_solders.pubkey())
-    async with aiohttp.ClientSession() as session:
-        raw = await self._build_swap_tx(session, route_info, pubkey_str)
-        if not raw:
-            return {"ok": False, "reason": "swap_build"}
-
-    # --- Sign with solders (0.26.x has no tx.sign([...])) ---
-    try:
-        from solders.transaction import VersionedTransaction as SVT  # type: ignore
-        # Parse the returned bytes to get the message we must sign
-        tx_unsigned = SVT.from_bytes(raw)
-        msg_obj = tx_unsigned.message  # VersionedMessage
-
-        # Get bytes for the message (serialize() preferred, else to_bytes(), else bytes())
-        msg_bytes = None
-        for attr in ("serialize", "to_bytes"):
-            fn = getattr(msg_obj, attr, None)
-            if callable(fn):
-                try:
-                    msg_bytes = fn()
-                    break
-                except Exception:
-                    pass
-        if msg_bytes is None:
+        # choose pubkey string
+        pubkey_str = None
+        if kp_solders is not None:
             try:
-                msg_bytes = bytes(msg_obj)
+                pubkey_str = str(kp_solders.pubkey())
             except Exception:
-                return {"ok": False, "reason": "solders_msg_serialize_failed"}
+                pubkey_str = None
+        if pubkey_str is None and kp_solana is not None:
+            try:
+                pubkey_str = str(kp_solana.public_key)
+            except Exception:
+                pubkey_str = None
 
-        # Produce a Signature over the message
-        sig = kp_solders.sign_message(msg_bytes)  # -> solders.signature.Signature
+        if not pubkey_str:
+            return {"ok": False, "reason": "wallet_decode"}
 
-        # Rebuild a *signed* VersionedTransaction from (message, [sig])
-        tx_signed = SVT(msg_obj, [sig])
-        raw_signed = bytes(tx_signed)
-    except Exception as e:
-        return {"ok": False, "reason": f"solders_sign_fail: {e}"}
+        # Build swap transaction
+        async with aiohttp.ClientSession() as session:
+            raw = await self._build_swap_tx(session, route_info, pubkey_str)
+            if not raw:
+                return {"ok": False, "reason": "swap_build"}
 
-    # --- Send the signed tx ---
-    try:
-        from solana.rpc.async_api import AsyncClient
-        from solana.rpc.types import TxOpts
-        async with AsyncClient(Cfg.RPC_URL) as rpc:
-            resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
-            sig = str(resp.value)
-            await self.send_msg(f"🟢 Executed BUY (live) — tx: {sig}")
-            return {"ok": True, "txsig": sig}
-    except Exception as e:
-        return {"ok": False, "reason": f"tx_send_{e}"}
+        raw_signed: Optional[bytes] = None
+
+        # --- Sign with solders (no .sign() in 0.26) ---
+        try:
+            from solders.transaction import VersionedTransaction as SVT
+            tx_unsigned = SVT.from_bytes(raw)
+            msg_bytes = None
+            for attr in ("serialize", "to_bytes"):
+                fn = getattr(tx_unsigned.message, attr, None)
+                if callable(fn):
+                    try:
+                        msg_bytes = fn()
+                        break
+                    except Exception:
+                        pass
+            if msg_bytes is None:
+                msg_bytes = bytes(tx_unsigned.message)
+
+            sig = kp_solders.sign_message(msg_bytes)
+            tx_signed = SVT(tx_unsigned.message, [sig])
+            raw_signed = bytes(tx_signed)
+        except Exception as e:
+            logger.warning(f"[Exec] solders sign path failed: {e}")
+
+        # --- Submit transaction ---
+        if raw_signed is not None:
+            try:
+                from solana.rpc.async_api import AsyncClient
+                from solana.rpc.types import TxOpts
+                async with AsyncClient(Cfg.RPC_URL) as rpc:
+                    resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
+                    sig_str = str(resp.value)
+                    await self.send_msg(f"🟢 Executed BUY (live) — tx: {sig_str}")
+                    return {"ok": True, "txsig": sig_str}
+            except Exception as e:
+                return {"ok": False, "reason": f"tx_send_{e}"}
+
+        return {"ok": False, "reason": "tx_sign_failed"}
