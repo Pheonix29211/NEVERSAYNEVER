@@ -1,5 +1,4 @@
 # src/routers/execution.py
-from __future__ import annotations
 
 import os
 import json
@@ -11,10 +10,11 @@ import aiohttp
 from ..config import Cfg
 from ..log import logger
 
+# ---- Constants ----
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
-# ---------- Key loading helpers ----------
+# =============================== Key helpers ===============================
 
 def _decode_json_array(s: str) -> Optional[bytes]:
     """Parse a JSON array like [1,2,...] into bytes (expects 32 or 64 length)."""
@@ -45,7 +45,27 @@ def _decode_base58(s: str) -> Optional[bytes]:
         return None
 
 
-def _env_secret_bytes() -> Optional[bytes]:
+def _candidate_key_paths() -> list[str]:
+    """
+    Preferred order for file keys:
+    1) SOLANA_KEY_PATH (if set)
+    2) /data/my_wallet_key.json
+    3) /data/phantom_key.json
+    """
+    paths: list[str] = []
+    if Cfg.SOLANA_KEY_PATH:
+        paths.append(Cfg.SOLANA_KEY_PATH)
+    paths.append(os.path.join(Cfg.DATA_DIR, "my_wallet_key.json"))
+    paths.append(os.path.join(Cfg.DATA_DIR, "phantom_key.json"))
+    # dedupe preserving order
+    seen, out = set(), []
+    for p in paths:
+        if p and p not in seen:
+            out.append(p); seen.add(p)
+    return out
+
+
+def _load_secret_bytes_from_env() -> Optional[bytes]:
     """Try to read key material from SOLANA_SECRET_KEY env (JSON array or base58)."""
     secret = (Cfg.SOLANA_SECRET_KEY or "").strip()
     if not secret:
@@ -60,28 +80,19 @@ def _env_secret_bytes() -> Optional[bytes]:
     return None
 
 
-def _key_file_candidates() -> list[str]:
-    """Candidate key file paths (first existing wins)."""
-    out = []
-    if Cfg.SOLANA_KEY_PATH:
-        out.append(Cfg.SOLANA_KEY_PATH)
-    # common fallbacks
-    out.append(os.path.join(Cfg.DATA_DIR, "my_wallet_key.json"))
-    out.append(os.path.join(Cfg.DATA_DIR, "phantom_key.json"))
-    return out
-
-
-def _file_secret_bytes() -> Optional[bytes]:
-    """Try to read key material from file (JSON array or base58)."""
-    for path in _key_file_candidates():
+def _load_secret_bytes_from_file() -> Optional[bytes]:
+    """Try file(s) in preferred order, read content as JSON-array or base58 string."""
+    for path in _candidate_key_paths():
         try:
             if not os.path.exists(path):
                 continue
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
+            # JSON array?
             b = _decode_json_array(content)
             if b:
                 return b
+            # base58?
             b = _decode_base58(content)
             if b:
                 return b
@@ -92,52 +103,59 @@ def _file_secret_bytes() -> Optional[bytes]:
 
 
 def _secret_bytes() -> Optional[bytes]:
-    """Unified loader: env first, then file."""
-    b = _env_secret_bytes()
+    """Unified loader: env first, then files in preferred order."""
+    b = _load_secret_bytes_from_env()
     if b:
         return b
-    return _file_secret_bytes()
+    b = _load_secret_bytes_from_file()
+    if b:
+        return b
+    return None
 
 
-def _load_keypairs():
+def _load_keypair():
     """
-    Return (solders_kp, solana_kp) — whichever can be constructed from the secret bytes.
-    - 64-byte secret is preferred.
-    - 32-byte seed only works if library exposes 'from_seed' (often not present).
+    Load solders.Keypair from either:
+    - 64-byte secret key (private+public)
+    - 32-byte seed (if supported by library via from_seed)
     """
+    try:
+        from solders.keypair import Keypair  # lazy import
+    except Exception as e:
+        logger.warning(f"[Exec] solders not available: {e}")
+        return None
+
     raw = _secret_bytes()
     if not raw:
         logger.warning("[Exec] no key material found (env/file)")
-        return None, None
+        return None
 
-    # solders
-    kp_solders = None
-    try:
-        from solders.keypair import Keypair as SKeypair  # type: ignore
-        if len(raw) == 64:
-            kp_solders = SKeypair.from_bytes(raw)
-        elif len(raw) == 32 and hasattr(SKeypair, "from_seed"):
-            kp_solders = SKeypair.from_seed(raw)  # type: ignore
-    except Exception as e:
-        logger.warning(f"[Exec] solders keypair load failed: {e}")
+    # 64-byte secret (preferred)
+    if len(raw) == 64:
+        try:
+            return Keypair.from_bytes(raw)
+        except Exception as e:
+            logger.warning(f"[Exec] Keypair.from_bytes(64) failed: {e}")
 
-    # solana-py
-    kp_solana = None
-    try:
-        from solana.keypair import Keypair as PyKeypair  # type: ignore
-        if len(raw) == 64:
-            kp_solana = PyKeypair.from_secret_key(raw)
-        # (solana-py usually doesn't support from seed directly)
-    except Exception as e:
-        logger.warning(f"[Exec] solana-py keypair load failed: {e}")
+    # 32-byte seed (if from_seed exists in this build)
+    if len(raw) == 32:
+        try:
+            from_seed = getattr(Keypair, "from_seed", None)
+            if callable(from_seed):
+                return from_seed(raw)
+            else:
+                logger.warning("[Exec] 32-byte seed provided but Keypair.from_seed not available in this build")
+        except Exception as e:
+            logger.warning(f"[Exec] Keypair.from_seed failed: {e}")
 
-    return kp_solders, kp_solana
+    logger.warning(f"[Exec] unsupported secret length: {len(raw)} (need 64, or 32 with from_seed support)")
+    return None
 
 
 async def _rpc_get_sol_balance(pubkey_str: str) -> Optional[float]:
     try:
         from solana.rpc.async_api import AsyncClient  # lazy
-        from solders.pubkey import Pubkey            # type: ignore
+        from solders.pubkey import Pubkey
     except Exception as e:
         logger.warning(f"[Exec] solana client not available: {e}")
         return None
@@ -151,9 +169,7 @@ async def _rpc_get_sol_balance(pubkey_str: str) -> Optional[float]:
         return None
 
 
-# ---------- Execution Engine ----------
-
-# ---------- Execution Engine ----------
+# =============================== ExecutionEngine ===============================
 
 class ExecutionEngine:
     def __init__(self, base_quote_url: str, send_msg):
@@ -161,24 +177,20 @@ class ExecutionEngine:
         self.send_msg = send_msg
 
     async def preflight(self) -> Dict[str, Any]:
-        # Presence check (env/file)
-        if not (Cfg.SOLANA_SECRET_KEY or Cfg.SOLANA_KEY_PATH):
-            if not os.path.exists(os.path.join(Cfg.DATA_DIR, "my_wallet_key.json")) and \
-               not os.path.exists(os.path.join(Cfg.DATA_DIR, "phantom_key.json")):
-                return {"ok": False, "reason": "no_wallet"}
-
-        kp_solders, _kp_solana_unused = _load_keypairs()
-        if not kp_solders:
+        # Ensure key can be loaded
+        kp = _load_keypair()
+        if not kp:
             return {"ok": False, "reason": "wallet_decode"}
 
+        # Ensure send libs exist
         try:
-            from solana.rpc.async_api import AsyncClient  # just to ensure package exists
+            from solana.rpc.async_api import AsyncClient  # noqa: F401
         except Exception:
             return {"ok": False, "reason": "solana_lib_missing"}
 
-        # check balance using solders pubkey
+        # Balance check
         try:
-            pubkey_str = str(kp_solders.pubkey())
+            pubkey_str = str(kp.pubkey())
         except Exception:
             return {"ok": False, "reason": "wallet_decode"}
 
@@ -188,11 +200,16 @@ class ExecutionEngine:
         if sol < Cfg.LIVE_MIN_SOL_BUFFER:
             return {"ok": False, "reason": f"low_sol ({sol:.4f})"}
 
-        # Probe quote endpoint quickly
+        # Probe Jupiter quote
         async with aiohttp.ClientSession() as session:
             try:
                 url = f"{self.base}/quote"
-                params = {"inputMint": USDC_MINT, "outputMint": USDC_MINT, "amount": "1000", "slippageBps": "300"}
+                params = {
+                    "inputMint": USDC_MINT,
+                    "outputMint": USDC_MINT,
+                    "amount": "1000",
+                    "slippageBps": "300",
+                }
                 async with session.get(url, params=params, timeout=8) as r:
                     if r.status != 200:
                         return {"ok": False, "reason": f"quote_http_{r.status}"}
@@ -204,16 +221,16 @@ class ExecutionEngine:
         self,
         session: aiohttp.ClientSession,
         route_info: Dict[str, Any],
-        user_pubkey: str
+        user_pubkey: str,
     ) -> Optional[bytes]:
         """
-        Ask Jupiter to build serialized (base64) swap tx from a quote.
+        Ask Jupiter to build a base64-serialized VersionedTransaction for the quote.
         """
         url = f"{self.base}/swap"
         payload = {
             "quoteResponse": route_info,
             "userPublicKey": user_pubkey,
-            "wrapAndUnwrapSol": True
+            "wrapAndUnwrapSol": True,
         }
         try:
             async with session.post(url, json=payload, timeout=15) as r:
@@ -232,70 +249,65 @@ class ExecutionEngine:
 
     async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Live BUY execution path. In DRY_RUN, only simulates.
+        LIVE buy path. In DRY_RUN it short-circuits.
         """
         if Cfg.DRY_RUN:
             return {"ok": True, "simulated": True, "txsig": None}
 
-        # Load solders keypair (we only need one working path)
-        kp_solders, _kp_solana_unused = _load_keypairs()
-        if not kp_solders:
+        # Load solders keypair only (no solana.keypair usage)
+        kp = _load_keypair()
+        if not kp:
             return {"ok": False, "reason": "wallet_decode"}
 
         try:
-            user_pubkey = str(kp_solders.pubkey())
+            user_pubkey = str(kp.pubkey())
         except Exception:
             return {"ok": False, "reason": "wallet_decode"}
 
-        # Build raw unsigned tx from Jupiter
+        # Build unsigned swap transaction from Jupiter
         async with aiohttp.ClientSession() as session:
             raw = await self._build_swap_tx(session, route_info, user_pubkey)
             if not raw:
                 return {"ok": False, "reason": "swap_build"}
 
-        # --- Sign with solders (no .sign() on VersionedTransaction in 0.26) ---
-       # --- Path A: sign with solders (v0.26 has no .sign()) ---
-try:
-    from solders.transaction import VersionedTransaction as SVT  # type: ignore
-
-    if kp_solders is None:
-        raise RuntimeError("no_solders_key")
-
-    # 1) Parse the unsigned Jupiter tx bytes
-    vt_unsigned = SVT.from_bytes(raw)        # raw is the bytes from /swap
-    msg = vt_unsigned.message                # VersionedMessage
-
-    # 2) Serialize the message (different builds expose different names)
-    msg_bytes = None
-    for attr in ("serialize", "to_bytes"):
-        fn = getattr(msg, attr, None)
-        if callable(fn):
-            try:
-                msg_bytes = fn()
-                break
-            except Exception:
-                pass
-    if msg_bytes is None:
+        # ---- Sign with solders (solders==0.26.0 has no tx.sign()) ----
         try:
-            msg_bytes = bytes(msg)
-        except Exception:
-            return {"ok": False, "reason": "solders_msg_serialize_failed"}
+            from solders.transaction import VersionedTransaction as SVT  # type: ignore
 
-    # 3) Sign the message and construct a NEW signed VersionedTransaction
-    sig = kp_solders.sign_message(msg_bytes)   # -> solders.signature.Signature
-    vt_signed = SVT(msg, [sig])                # build signed tx
-    raw_signed = bytes(vt_signed)              # ready to submit
-except Exception as e:
-    return {"ok": False, "reason": f"solders_sign_fail: {e}"}
+            vt_unsigned = SVT.from_bytes(raw)
+            msg = vt_unsigned.message  # VersionedMessage
 
-# --- Submit via solana AsyncClient ---
-try:
-    from solana.rpc.async_api import AsyncClient
-    from solana.rpc.types import TxOpts
-    async with AsyncClient(Cfg.RPC_URL) as rpc:
-        resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
-        txsig = str(resp.value)
-        await self.send_msg(f"🟢 Executed BUY (live) — tx: {txsig}")
-        return {"ok": True, "txsig": txsig}
-except Exception as e:
-    return {"ok": False, "reason": f"tx_send_{e}"}
+            # Serialize the message (try serialize/to_bytes/bytes)
+            msg_bytes = None
+            for attr in ("serialize", "to_bytes"):
+                fn = getattr(msg, attr, None)
+                if callable(fn):
+                    try:
+                        msg_bytes = fn()
+                        break
+                    except Exception:
+                        pass
+            if msg_bytes is None:
+                try:
+                    msg_bytes = bytes(msg)
+                except Exception:
+                    return {"ok": False, "reason": "solders_msg_serialize_failed"}
+
+            # Sign message and build NEW signed VersionedTransaction
+            sig = kp.sign_message(msg_bytes)  # -> solders.signature.Signature
+            vt_signed = SVT(msg, [sig])
+            raw_signed = bytes(vt_signed)
+        except Exception as e:
+            return {"ok": False, "reason": f"solders_sign_fail: {e}"}
+
+        # ---- Send via solana AsyncClient ----
+        try:
+            from solana.rpc.async_api import AsyncClient
+            from solana.rpc.types import TxOpts
+            async with AsyncClient(Cfg.RPC_URL) as rpc:
+                resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
+                txsig = str(resp.value)
+                await self.send_msg(f"🟢 Executed BUY (live) — tx: {txsig}")
+                return {"ok": True, "txsig": txsig}
+        except Exception as e:
+            return {"ok": False, "reason": f"tx_send_{e}"}
