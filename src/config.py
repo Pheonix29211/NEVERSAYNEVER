@@ -76,12 +76,45 @@ class Cfg:
     PAPER_AUTOTRADE = os.environ.get("PAPER_AUTOTRADE", "true").lower() == "true"
     NIGHTLY_REPORT_LOCAL = os.environ.get("NIGHTLY_REPORT_LOCAL", "23:45")  # IST
 
-    @staticmethod
+        @staticmethod
     def has_live_key() -> bool:
-        try:
-            if not Cfg.SOLANA_SECRET_KEY:
-                return False
-            arr = json.loads(Cfg.SOLANA_SECRET_KEY)
-            return isinstance(arr, list) and len(arr) in (32, 64)
-        except Exception:
+        """
+        Accepts:
+          1) SOLANA_SECRET_KEY as JSON array (32/64 ints)
+          2) SOLANA_SECRET_KEY as base58 string
+          3) SOLANA_SECRET_KEY as path to a file in the container whose contents
+             are JSON array or base58.
+        """
+        import os, json
+
+        raw = (Cfg.SOLANA_SECRET_KEY or "").strip()
+        if not raw:
             return False
+
+        # If looks like a file path, try reading it
+        if (raw.startswith("/") or raw.startswith("./")) and os.path.exists(raw):
+            try:
+                with open(raw, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+            except Exception:
+                return False
+
+        # Try JSON array (32/64)
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, list) and len(arr) in (32, 64) and all(isinstance(x, int) for x in arr):
+                return True
+        except Exception:
+            pass
+
+        # Try base58 decode
+        try:
+            import base58  # pip install base58 (already in your local env)
+            b = base58.b58decode(raw)
+            # 64 bytes = ed25519 secret seed; some exports are 32
+            if len(b) in (32, 64):
+                return True
+        except Exception:
+            pass
+
+        return False
