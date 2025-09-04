@@ -201,7 +201,7 @@ class ExecutionEngine:
             logger.warning(f"[Exec] swap_build_error: {e}")
             return None
 
-    async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str,Any]) -> Dict[str,Any]:
+   async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str,Any]) -> Dict[str,Any]:
         if Cfg.DRY_RUN:
             return {"ok": True, "simulated": True, "txsig": None}
 
@@ -216,14 +216,14 @@ class ExecutionEngine:
         except Exception as e:
             return {"ok": False, "reason": f"solana_lib_missing: {e}"}
 
-        # FIXED: proper indentation of the request block
         async with aiohttp.ClientSession() as session:
             raw = await self._build_swap_tx(session, route_info, str(kp.pubkey()))
             if not raw:
                 return {"ok": False, "reason": "swap_build"}
 
         try:
-            tx = VersionedTransaction.deserialize(raw)
+            # 🔥 FIX: use from_bytes, not deserialize
+            tx = VersionedTransaction.from_bytes(raw)
             tx.sign([kp])
         except Exception as e:
             return {"ok": False, "reason": f"tx_sign_{e}"}
