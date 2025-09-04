@@ -82,19 +82,24 @@ class TGBot:
 
     async def safe_send(self, text: str):
         try:
-            await asyncio.get_event_loop().run_in_executor(None, self.app.bot.send_message, Cfg.ADMIN_CHAT_ID, text)
+            await asyncio.get_event_loop().run_in_executor(
+                None, self.app.bot.send_message, Cfg.ADMIN_CHAT_ID, text
+            )
         except Exception as e:
             logger.warning(f"[TG] send failed: {e}")
 
     # ---- commands ----
-    def _start(self, u: Update, c: CallbackContext): u.message.reply_text("✨ I’m awake! Use /help to see commands.")
-    def _help(self, u: Update, c: CallbackContext): u.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    def _start(self, u: Update, c: CallbackContext):
+        u.message.reply_text("✨ I’m awake! Use /help to see commands.")
+
+    def _help(self, u: Update, c: CallbackContext):
+        u.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
     def _status(self, u: Update, c: CallbackContext):
         mode = "DRY_RUN" if Cfg.DRY_RUN else "LIVE"
         trail = f"Trailing-only: ON (ATR={Cfg.ATR_WINDOW}, K={Cfg.TRAIL_K})"
         u.message.reply_text(
-            f"⚡ Status:\nMode: {mode}\nRouter: {Cfg.ROUTER}\n"
+            f"⚡️ Status:\nMode: {mode}\nRouter: {Cfg.ROUTER}\n"
             f"Per-trade target: ${Cfg.PER_TRADE_USD_TARGET:.2f}\nMax slots: {Cfg.MAX_OPEN_POSITIONS}\n"
             f"Fee cap: {Cfg.FEE_CAP_PCT:.1f}% | Slippage cap: {Cfg.MAX_SLIPPAGE_PCT:.1f}%\n{trail}"
         )
@@ -102,42 +107,62 @@ class TGBot:
     def _mode(self, u: Update, c: CallbackContext):
         args = c.args or []
         if not args:
-            u.message.reply_text(f"Mode is currently {'DRY_RUN' if Cfg.DRY_RUN else 'LIVE'}.\nUse `/mode live [PIN]` or `/mode paper`.", parse_mode=ParseMode.MARKDOWN)
+            u.message.reply_text(
+                f"Mode is currently {'DRY_RUN' if Cfg.DRY_RUN else 'LIVE'}.\n"
+                "Use /mode live [PIN] or /mode paper.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
         target = args[0].lower()
         if target == "paper":
             Cfg.DRY_RUN = True
-            u.message.reply_text("🔧 Switched to PAPER mode (no real trades)."); return
+            u.message.reply_text("🔧 Switched to PAPER mode (no real trades).")
+            return
         if target == "live":
             pin = os.environ.get("MODE_SWITCH_PIN", "").strip()
             if pin and (len(args) < 2 or args[1] != pin):
-                u.message.reply_text("⛔ PIN required. Usage: `/mode live 1234`", parse_mode=ParseMode.MARKDOWN); return
+                u.message.reply_text(
+                    "⛔️ PIN required. Usage: /mode live 1234",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
             Cfg.DRY_RUN = False
-            u.message.reply_text("🟢 Switched to LIVE mode (make sure wallet & funds are configured)."); return
-        u.message.reply_text("Usage: `/mode`, `/mode live [PIN]`, `/mode paper`", parse_mode=ParseMode.MARKDOWN)
+            u.message.reply_text("🟢 Switched to LIVE mode (make sure wallet & funds are configured).")
+            return
+        u.message.reply_text("Usage: /mode, /mode live [PIN], /mode paper", parse_mode=ParseMode.MARKDOWN)
 
     def _preflight(self, u: Update, c: CallbackContext):
         from ..routers.execution import ExecutionEngine
+
         async def run():
             ee = ExecutionEngine(Cfg.PHOTON_BASE, lambda m: self.app.bot.send_message(Cfg.ADMIN_CHAT_ID, m))
             res = await ee.preflight()
-            if res.get("ok"): 
+            if res.get("ok"):
                 await self.safe_send("✅ Preflight OK: wallet & routing healthy.")
             else:
                 await self.safe_send(f"⚠️ Preflight failed: {res.get('reason')}")
+
         asyncio.get_event_loop().create_task(run())
         u.message.reply_text("🔎 Running preflight…")
 
-   def _wallet(self, u: Update, c: CallbackContext):
-    try:
-        kp = _load_keypair()
-        if not kp:
-            u.message.reply_text("❌ No wallet configured or key could not be decoded.")
-            return
-        pub = str(kp.pubkey())
-        u.message.reply_text(f"🔑 Wallet: `{pub}`\n(RPC: {Cfg.RPC_URL})", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        u.message.reply_text(f"Wallet error: {e}")
+    def _wallet(self, u: Update, c: CallbackContext):
+        try:
+            if not Cfg.has_live_key():
+                u.message.reply_text(
+                    "No wallet configured. Add SOLANA_SECRET_KEY or SOLANA_KEY_PATH in Render to trade live."
+                )
+                return
+            from ..routers.execution import _load_keypair
+            kp = _load_keypair()
+            if kp:
+                u.message.reply_text(
+                    f"🔑 Wallet: `{kp.pubkey()}`\n(RPC: {Cfg.RPC_URL})",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                u.message.reply_text("⚠️ Wallet could not be loaded. Check key format/env.")
+        except Exception as e:
+            u.message.reply_text(f"Wallet decode error: {e}")
 
     def _portfolio(self, u: Update, c: CallbackContext):
         u.message.reply_text(self.ledger.portfolio_text())
@@ -149,27 +174,36 @@ class TGBot:
     def _autopaper(self, u: Update, c: CallbackContext):
         args = c.args or []
         if not args:
-            u.message.reply_text(f"PAPER_AUTOTRADE is {'ON' if Cfg.PAPER_AUTOTRADE else 'OFF'}.\nUse `/autopaper on` or `/autopaper off`.")
+            u.message.reply_text(
+                f"PAPER_AUTOTRADE is {'ON' if Cfg.PAPER_AUTOTRADE else 'OFF'}.\nUse /autopaper on or /autopaper off."
+            )
             return
         v = args[0].lower()
-        if v in ("on","true","1"):
-            Cfg.PAPER_AUTOTRADE = True; u.message.reply_text("✅ Paper auto-trading enabled.")
-        elif v in ("off","false","0"):
-            Cfg.PAPER_AUTOTRADE = False; u.message.reply_text("⛔ Paper auto-trading disabled.")
+        if v in ("on", "true", "1"):
+            Cfg.PAPER_AUTOTRADE = True
+            u.message.reply_text("✅ Paper auto-trading enabled.")
+        elif v in ("off", "false", "0"):
+            Cfg.PAPER_AUTOTRADE = False
+            u.message.reply_text("⛔️ Paper auto-trading disabled.")
         else:
-            u.message.reply_text("Usage: `/autopaper on|off`")
+            u.message.reply_text("Usage: /autopaper on|off")
 
     def _export(self, u: Update, c: CallbackContext):
         tokens_glob = [p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("tokens_")]
         trades_glob = [p for p in os.listdir(Cfg.DATA_DIR) if p.startswith("trades_")]
-        tokens_glob.sort(); trades_glob.sort()
+        tokens_glob.sort()
+        trades_glob.sort()
         tokens = tokens_glob[-1] if tokens_glob else "(none)"
         trades = trades_glob[-1] if trades_glob else "(none)"
-        u.message.reply_text(f"📦 Latest CSVs:\n- Tokens: {os.path.join(Cfg.DATA_DIR,tokens)}\n- Trades: {os.path.join(Cfg.DATA_DIR,trades)}")
+        u.message.reply_text(
+            f"📦 Latest CSVs:\n- Tokens: {os.path.join(Cfg.DATA_DIR,tokens)}\n- Trades: {os.path.join(Cfg.DATA_DIR,trades)}"
+        )
 
     def _backtest(self, u: Update, c: CallbackContext):
-        try: hours = int(c.args[0]) if c.args else 24
-        except Exception: hours = 24
+        try:
+            hours = int(c.args[0]) if c.args else 24
+        except Exception:
+            hours = 24
         u.message.reply_text(f"🧪 Running Dex backtest for ~{hours}h…")
         try:
             res = asyncio.run(run_backtest(hours=hours))
@@ -189,8 +223,14 @@ class TGBot:
             )
             u.message.reply_text(msg)
         except Exception as e:
-            logger.warning(f"/backtest error: {e}"); u.message.reply_text(f"⚠️ Backtest failed: {e}")
+            logger.warning(f"/backtest error: {e}")
+            u.message.reply_text(f"⚠️ Backtest failed: {e}")
 
-    def _ping(self, u: Update, c: CallbackContext): u.message.reply_text("🏓 pong")
-    def _unknown(self, u: Update, c: CallbackContext): u.message.reply_text("🤖 Unknown command. Try /help")
-    def _on_error(self, update: Optional[Update], context: CallbackContext): logger.warning(f"[TG] error: {context.error}")
+    def _ping(self, u: Update, c: CallbackContext):
+        u.message.reply_text("🏓 pong")
+
+    def _unknown(self, u: Update, c: CallbackContext):
+        u.message.reply_text("🤖 Unknown command. Try /help")
+
+    def _on_error(self, update: Optional[Update], context: CallbackContext):
+        logger.warning(f"[TG] error: {context.error}")
