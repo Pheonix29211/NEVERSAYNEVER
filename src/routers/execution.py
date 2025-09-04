@@ -146,6 +146,8 @@ async def _rpc_get_sol_balance(pubkey_str: str) -> Optional[float]:
 
 # ---------- Execution Engine ----------
 
+# ---------- Execution Engine ----------
+
 class ExecutionEngine:
     def __init__(self, base_quote_url: str, send_msg):
         self.base = base_quote_url.rstrip("/")
@@ -175,7 +177,12 @@ class ExecutionEngine:
         async with aiohttp.ClientSession() as session:
             try:
                 url = f"{self.base}/quote"
-                params = {"inputMint": USDC_MINT, "outputMint": USDC_MINT, "amount": "1000", "slippageBps": "300"}
+                params = {
+                    "inputMint": USDC_MINT,
+                    "outputMint": USDC_MINT,
+                    "amount": "1000",
+                    "slippageBps": "300"
+                }
                 async with session.get(url, params=params, timeout=8) as r:
                     if r.status != 200:
                         return {"ok": False, "reason": f"quote_http_{r.status}"}
@@ -183,9 +190,13 @@ class ExecutionEngine:
                 return {"ok": False, "reason": f"quote_err_{e}"}
         return {"ok": True, "reason": "ok"}
 
-    async def _build_swap_tx(self, session: aiohttp.ClientSession, route_info: Dict[str,Any], user_pubkey: str) -> Optional[bytes]:
+    async def _build_swap_tx(self, session: aiohttp.ClientSession, route_info: Dict[str, Any], user_pubkey: str) -> Optional[bytes]:
         url = f"{self.base}/swap"
-        payload = {"quoteResponse": route_info, "userPublicKey": user_pubkey, "wrapAndUnwrapSol": True}
+        payload = {
+            "quoteResponse": route_info,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True
+        }
         try:
             async with session.post(url, json=payload, timeout=12) as r:
                 if r.status != 200:
@@ -201,7 +212,7 @@ class ExecutionEngine:
             logger.warning(f"[Exec] swap_build_error: {e}")
             return None
 
-      async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str,Any]) -> Dict[str,Any]:
+    async def execute_buy(self, mint: str, usd_amount: float, route_info: Dict[str, Any]) -> Dict[str, Any]:
         if Cfg.DRY_RUN:
             return {"ok": True, "simulated": True, "txsig": None}
 
@@ -222,7 +233,7 @@ class ExecutionEngine:
                 return {"ok": False, "reason": "swap_build"}
 
         try:
-            # 🔥 FIX: use from_bytes, not deserialize
+            # ✅ Correct: use from_bytes
             tx = VersionedTransaction.from_bytes(raw)
             tx.sign([kp])
         except Exception as e:
