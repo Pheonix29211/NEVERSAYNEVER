@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
 from ..config import Cfg
+from ..routers.execution import _load_keypair
 from ..log import logger
 from ..services.backtest.runner import run_backtest
 
@@ -127,16 +128,16 @@ class TGBot:
         asyncio.get_event_loop().create_task(run())
         u.message.reply_text("🔎 Running preflight…")
 
-    def _wallet(self, u: Update, c: CallbackContext):
-        try:
-            if not Cfg.has_live_key():
-                u.message.reply_text("No wallet configured. Add SOLANA_SECRET_KEY in Render to trade live."); return
-            from solders.keypair import Keypair
-            import json
-            kp = Keypair.from_bytes(bytes(json.loads(Cfg.SOLANA_SECRET_KEY)))
-            u.message.reply_text(f"🔑 Wallet: `{kp.pubkey()}`\n(RPC: {Cfg.RPC_URL})", parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            u.message.reply_text(f"Wallet decode error: {e}")
+   def _wallet(self, u: Update, c: CallbackContext):
+    try:
+        kp = _load_keypair()
+        if not kp:
+            u.message.reply_text("❌ No wallet configured or key could not be decoded.")
+            return
+        pub = str(kp.pubkey())
+        u.message.reply_text(f"🔑 Wallet: `{pub}`\n(RPC: {Cfg.RPC_URL})", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        u.message.reply_text(f"Wallet error: {e}")
 
     def _portfolio(self, u: Update, c: CallbackContext):
         u.message.reply_text(self.ledger.portfolio_text())
