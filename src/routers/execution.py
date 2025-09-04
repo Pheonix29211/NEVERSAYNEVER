@@ -182,16 +182,24 @@ class ExecutionEngine:
         if sol < Cfg.LIVE_MIN_SOL_BUFFER:
             return {"ok": False, "reason": f"low_sol ({sol:.4f})"}
 
-        # Probe quote endpoint
-        async with aiohttp.ClientSession() as session:
-            try:
-                url = f"{self.base}/quote"
-                params = {
-    "inputMint": USDC_MINT,
-    "outputMint": USDC_MINT,
-    "amount": "1000",
-    "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),   # <-- use env
-}
+       # Probe quote endpoint
+async with aiohttp.ClientSession() as session:
+    try:
+        url = f"{self.base}/quote"
+        params = {
+            "inputMint": USDC_MINT,
+            "outputMint": USDC_MINT,
+            "amount": "1000",
+            "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),  # use env
+        }
+        async with session.get(url, params=params, timeout=8) as r:
+            if r.status != 200:
+                return {"ok": False, "reason": f"quote_http_{r.status}"}
+    except Exception as e:
+        return {"ok": False, "reason": f"quote_err_{e}"}
+
+return {"ok": True, "reason": "ok"}   # ✅ out of try/except
+
 async def _build_swap_tx(
         self,
         session: aiohttp.ClientSession,
