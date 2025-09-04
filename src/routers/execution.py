@@ -154,7 +154,7 @@ class ExecutionEngine:
         self.base = base_quote_url.rstrip("/")
         self.send_msg = send_msg
 
-    async def preflight(self) -> Dict[str, Any]:
+       async def preflight(self) -> Dict[str, Any]:
         # quick presence check
         if not (Cfg.SOLANA_SECRET_KEY or Cfg.SOLANA_KEY_PATH):
             if not os.path.exists(os.path.join(Cfg.DATA_DIR, "my_wallet_key.json")) and \
@@ -182,25 +182,25 @@ class ExecutionEngine:
         if sol < Cfg.LIVE_MIN_SOL_BUFFER:
             return {"ok": False, "reason": f"low_sol ({sol:.4f})"}
 
-       # Probe quote endpoint
-async with aiohttp.ClientSession() as session:
-    try:
-        url = f"{self.base}/quote"
-        params = {
-            "inputMint": USDC_MINT,
-            "outputMint": USDC_MINT,
-            "amount": "1000",
-            "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),  # use env
-        }
-        async with session.get(url, params=params, timeout=8) as r:
-            if r.status != 200:
-                return {"ok": False, "reason": f"quote_http_{r.status}"}
-    except Exception as e:
-        return {"ok": False, "reason": f"quote_err_{e}"}
+        # Probe quote endpoint (align slippage with execution)
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = f"{self.base}/quote"
+                params = {
+                    "inputMint": USDC_MINT,
+                    "outputMint": USDC_MINT,
+                    "amount": "1000",
+                    "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),
+                }
+                async with session.get(url, params=params, timeout=8) as r:
+                    if r.status != 200:
+                        return {"ok": False, "reason": f"quote_http_{r.status}"}
+            except Exception as e:
+                return {"ok": False, "reason": f"quote_err_{e}"}
 
-return {"ok": True, "reason": "ok"}   # ✅ out of try/except
+        return {"ok": True, "reason": "ok"}
 
-async def _build_swap_tx(
+    async def _build_swap_tx(
         self,
         session: aiohttp.ClientSession,
         route_info: Dict[str, Any],
@@ -215,7 +215,7 @@ async def _build_swap_tx(
             "userPublicKey": user_pubkey,
             "wrapAndUnwrapSol": True,
             "slippageBps": Cfg.JUPITER_SLIPPAGE_BPS,
-            "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS
+            "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS,
         }
         try:
             async with session.post(url, json=payload, timeout=15) as r:
@@ -228,6 +228,10 @@ async def _build_swap_tx(
                 if not b64:
                     return None
                 return base64.b64decode(b64)
+        except Exception as e:
+            logger.warning(f"[Exec] swap_build_error: {e}")
+            return None
+            return base64.b64decode(b64)
         except Exception as e:
             logger.warning(f"[Exec] swap_build_error: {e}")
             return None
