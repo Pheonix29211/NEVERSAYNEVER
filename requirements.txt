@@ -14,5 +14,5 @@ python-dotenv>=1.0.1
 
 # Execution (sign + send on Solana) — only used in LIVE
 solders==0.26.0
-solana>=0.41.0
+solana==0.36.9
 base58>=2.1.1
