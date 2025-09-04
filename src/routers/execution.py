@@ -228,35 +228,39 @@ class ExecutionEngine:
                 return {"ok": False, "reason": "swap_build"}
 
         # --- Sign with solders (since solana.transaction is not available) ---
+       try:
+    from solders.transaction import VersionedTransaction as SVT
+    from solders.presigner import Presigner
+
+    # Parse unsigned tx, get message bytes
+    tx_unsigned = SVT.from_bytes(raw)
+    msg_obj = tx_unsigned.message
+
+    # message -> bytes (serialize / to_bytes / bytes fallback)
+    msg_bytes = None
+    for attr in ("serialize", "to_bytes"):
+        fn = getattr(msg_obj, attr, None)
+        if callable(fn):
+            try:
+                msg_bytes = fn()
+                break
+            except Exception:
+                pass
+    if msg_bytes is None:
         try:
-            from solders.transaction import VersionedTransaction as SVT
-            # Parse unsigned tx -> get message bytes
-            tx_unsigned = SVT.from_bytes(raw)
-            msg_obj = tx_unsigned.message
+            msg_bytes = bytes(msg_obj)
+        except Exception:
+            return {"ok": False, "reason": "solders_msg_serialize_failed"}
 
-            # Get bytes of the message
-            msg_bytes = None
-            for attr in ("serialize", "to_bytes"):
-                fn = getattr(msg_obj, attr, None)
-                if callable(fn):
-                    try:
-                        msg_bytes = fn()
-                        break
-                    except Exception:
-                        pass
-            if msg_bytes is None:
-                try:
-                    msg_bytes = bytes(msg_obj)
-                except Exception:
-                    return {"ok": False, "reason": "solders_msg_serialize_failed"}
+    # Create signature, wrap in Presigner (acts as a Signer)
+    sig = kp_solders.sign_message(msg_bytes)          # -> solders.signature.Signature
+    presigner = Presigner(kp_solders.pubkey(), sig)   # <- THIS is the Signer the TX expects
 
-            # Sign message with our Keypair
-            sig = kp.sign_message(msg_bytes)  # solders.signature.Signature
-            # Build a NEW signed transaction: SVT(message, [Signature])
-            tx_signed = SVT(msg_obj, [sig])
-            raw_signed = bytes(tx_signed)
-        except Exception as e:
-            return {"ok": False, "reason": f"solders_sign_fail: {e}"}
+    # Build signed transaction
+    tx_signed = SVT(msg_obj, [presigner])
+    raw_signed = bytes(tx_signed)
+except Exception as e:
+    return {"ok": False, "reason": f"solders_sign_fail: {e}"}
 
         # --- Send via solana AsyncClient ---
         try:
