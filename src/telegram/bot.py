@@ -1,12 +1,14 @@
 from __future__ import annotations
 import os, asyncio
 from typing import Optional, List, Dict, Any
+
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
+
 from ..config import Cfg
-from ..routers.execution import _load_keypair
 from ..log import logger
 from ..services.backtest.runner import run_backtest
+from ..routers.execution import ExecutionEngine  # ← add this
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
