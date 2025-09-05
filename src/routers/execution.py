@@ -149,8 +149,10 @@ async def _rpc_get_sol_balance(pubkey_str: str) -> Optional[float]:
         return None
 
 # ---------- Execution Engine ----------
+# ---------- Execution Engine ----------
 class ExecutionEngine:
-    def __init__(self, base_quote_url: str, send_msg):
+    def init(self, base_quote_url: str, send_msg):
+        # keep the same signature you already used elsewhere
         self.base = base_quote_url.rstrip("/")
         self.send_msg = send_msg
 
@@ -165,8 +167,9 @@ class ExecutionEngine:
         if not kp_solders:
             return {"ok": False, "reason": "wallet_decode"}
 
+        # ensure solana AsyncClient exists (we don't use solana.transaction)
         try:
-            from solana.rpc.async_api import AsyncClient  # noqa
+            from solana.rpc.async_api import AsyncClient  # noqa: F401
         except Exception:
             return {"ok": False, "reason": "solana_lib_missing"}
 
@@ -182,7 +185,7 @@ class ExecutionEngine:
         if sol < Cfg.LIVE_MIN_SOL_BUFFER:
             return {"ok": False, "reason": f"low_sol ({sol:.4f})"}
 
-        # Probe quote endpoint
+        # Probe quote endpoint (use the same slippage you intend to trade with)
         async with aiohttp.ClientSession() as session:
             try:
                 url = f"{self.base}/quote"
@@ -190,11 +193,12 @@ class ExecutionEngine:
                     "inputMint": USDC_MINT,
                     "outputMint": USDC_MINT,
                     "amount": "1000",
-                    "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),  # use env
+                    "slippageBps": str(Cfg.JUPITER_SLIPPAGE_BPS),
                 }
                 async with session.get(url, params=params, timeout=8) as r:
                     if r.status != 200:
-                        return {"ok": False, "reason": f"quote_http_{r.status}"}
+                        txt = await r.text()
+                        return {"ok": False, "reason": f"quote_http_{r.status}:{txt[:120]}"}
             except Exception as e:
                 return {"ok": False, "reason": f"quote_err_{e}"}
 
@@ -214,6 +218,7 @@ class ExecutionEngine:
             "quoteResponse": route_info,
             "userPublicKey": user_pubkey,
             "wrapAndUnwrapSol": True,
+            # force our config knobs into the final tx
             "slippageBps": Cfg.JUPITER_SLIPPAGE_BPS,
             "prioritizationFeeLamports": Cfg.PRIORITY_FEE_LAMPORTS
         }
@@ -221,11 +226,12 @@ class ExecutionEngine:
             async with session.post(url, json=payload, timeout=15) as r:
                 if r.status != 200:
                     txt = await r.text()
-                    logger.warning(f"[Exec] swap_http_{r.status}: {txt[:200]}")
+                    logger.warning(f"[Exec] swap_http_{r.status}: {txt[:400]}")
                     return None
                 js = await r.json()
                 b64 = js.get("swapTransaction") or js.get("serializedTransaction")
                 if not b64:
+                    logger.warning(f"[Exec] swap_build_missing_tx: {js}")
                     return None
                 return base64.b64decode(b64)
         except Exception as e:
@@ -238,6 +244,12 @@ class ExecutionEngine:
         """
         if Cfg.DRY_RUN:
             return {"ok": True, "simulated": True, "txsig": None}
+
+        # show exactly what we're applying
+        logger.info(
+            f"[Exec] using slippageBps={Cfg.JUPITER_SLIPPAGE_BPS}, "
+            f"priorityLamports={Cfg.PRIORITY_FEE_LAMPORTS}"
+        )
 
         kp_solders, _ = _load_keypairs()
         if not kp_solders:
@@ -264,14 +276,40 @@ class ExecutionEngine:
         except Exception as e:
             return {"ok": False, "reason": f"solders_sign_fail: {e}"}
 
-        # --- Send via solana AsyncClient (no solana.transaction import needed) ---
+        # --- Send via solana AsyncClient (skip preflight; faster path) ---
         try:
             from solana.rpc.async_api import AsyncClient
             from solana.rpc.types import TxOpts
+
             async with AsyncClient(Cfg.RPC_URL) as rpc:
-                resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
+                resp = await rpc.send_raw_transaction(
+                    raw_signed,
+                    opts=TxOpts(skip_preflight=True, preflight_commitment="processed")
+                )
                 sig = str(resp.value)
-                await self.send_msg(f"🟢 Executed BUY (live) — tx: {sig}")
+
+                # Inform immediately
+                await self.send_msg(
+                    f"🟢 Executed BUY (live) — tx: {sig}\n"
+                    f"(slip {Cfg.JUPITER_SLIPPAGE_BPS/100:.2f}%, priority {Cfg.PRIORITY_FEE_LAMPORTS} lamports)"
+                )
+
+                # Fetch full meta/logs to expose precise failure reasons if any
+                try:
+                    conf = await rpc.get_transaction(sig, max_supported_transaction_version=0)
+                    v = getattr(conf, "value", None)
+                    if v and isinstance(v, dict):
+                        meta = v.get("meta")
+                        if meta:
+                            err = meta.get("err")
+                            logs = meta.get("logMessages")
+                            if err:
+                                logger.error(f"[Exec] Tx err={err}; logs={logs}")
+                                # bubble up a readable reason for your radar loop
+                                return {"ok": False, "reason": f"chain_err:{err}", "txsig": sig, "logs": logs}
+                except Exception as e_meta:
+                    logger.warning(f"[Exec] get_transaction meta fetch err: {e_meta}")
+
                 return {"ok": True, "txsig": sig}
         except Exception as e:
             return {"ok": False, "reason": f"tx_send_{e}"}
