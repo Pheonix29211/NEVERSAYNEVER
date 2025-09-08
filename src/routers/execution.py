@@ -148,6 +148,8 @@ async def is_fungible_token_mint(mint_str: str) -> bool:
 class ExecutionEngine:
     def __init__(self, base_quote_url: str, send_msg):
         self.base = base_quote_url.rstrip("/")
+        if self.base.endswith('/quote'):
+            self.base = self.base[:-6]
         self.send_msg = send_msg
     async def preflight(self) -> Dict[str, Any]:
         # quick presence check
