@@ -230,9 +230,14 @@ class ExecutionEngine:
         try:
             from solana.rpc.async_api import AsyncClient
             from solana.rpc.types import TxOpts
+            from solana.rpc.commitment import Confirmed
             async with AsyncClient(Cfg.RPC_URL) as rpc:
-                resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=True))
+                resp = await rpc.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed))
                 sig = str(resp.value)
+                # Confirm the transaction
+                confirm_resp = await rpc.confirm_transaction(sig, commitment=Confirmed)
+                if not confirm_resp.value:
+                    return {"ok": False, "reason": "tx_confirmation_failed"}
                 await self.send_msg(f"🟢 Executed BUY (live) — tx: {sig}")
                 return {"ok": True, "txsig": sig}
         except Exception as e:
